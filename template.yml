@@ -1,0 +1,169 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Parameters:
+  DBInstanceIdentifier:
+    Type: String
+  MasterSecretArn:
+    Type: String
+  PrimaryUsername:
+    Type: String
+    Default: primary_user
+  VpcSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup::Id
+  DBName:
+    Type: String
+    Default: mydb
+
+Resources:
+
+  #######################################
+  # Secrets Manager secret for primary user
+  #######################################
+  PrimaryUserSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}-primary-user-secret"
+      Description: "Primary PostgreSQL user secret for app, managed rotation"
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username":"${PrimaryUsername}"}'
+        GenerateStringKey: "password"
+        PasswordLength: 30
+        ExcludeCharacters: '"@/\\'
+      Tags:
+        - Key: stack
+          Value: !Ref AWS::StackName
+
+  #######################################
+  # Lambda to create primary user using the secret-generated password
+  #######################################
+  CreatePrimaryUserLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaSecretsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref MasterSecretArn
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref PrimaryUserSecret
+
+  CreatePrimaryUserLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt CreatePrimaryUserLambdaRole.Arn
+      Runtime: python3.11
+      Timeout: 300
+      VpcConfig:
+        SubnetIds: !Ref VpcSubnets
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+      Code:
+        ZipFile: |
+          import boto3, psycopg2, cfnresponse, json
+          def handler(event, context):
+              try:
+                  props = event['ResourceProperties']
+                  request_type = event['RequestType']
+                  db_host = props['DBHost']
+                  db_name = props['DBName']
+                  db_port = int(props.get('DBPort', 5432))
+                  master_secret_arn = props['MasterSecretArn']
+                  primary_user_secret_arn = props['PrimaryUserSecretArn']
+                  primary_user = props['PrimaryUsername']
+
+                  secrets_client = boto3.client('secretsmanager')
+
+                  # Get master credentials
+                  master_sec = secrets_client.get_secret_value(SecretId=master_secret_arn)
+                  master_creds = json.loads(master_sec['SecretString'])
+                  master_user = master_creds['username']
+                  master_pass = master_creds['password']
+
+                  # Get primary user password from Secrets Manager
+                  primary_sec = secrets_client.get_secret_value(SecretId=primary_user_secret_arn)
+                  primary_creds = json.loads(primary_sec['SecretString'])
+                  primary_pass = primary_creds['password']
+
+                  conn = psycopg2.connect(
+                      host=db_host, port=db_port, dbname=db_name,
+                      user=master_user, password=master_pass
+                  )
+                  conn.autocommit = True
+                  cur = conn.cursor()
+
+                  if request_type in ['Create', 'Update']:
+                      # Create primary user if not exists
+                      cur.execute(f"""
+                          DO $$
+                          BEGIN
+                              IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{primary_user}') THEN
+                                  CREATE USER {primary_user} WITH PASSWORD '{primary_pass}';
+                              END IF;
+                          END $$;
+                      """)
+                      # Grant basic privileges
+                      cur.execute(f"GRANT CONNECT ON DATABASE {db_name} TO {primary_user};")
+
+                  cur.close()
+                  conn.close()
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Message": "Primary user created"})
+              except Exception as e:
+                  print(e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Message": str(e)})
+
+  #######################################
+  # Custom Resource to invoke Lambda
+  #######################################
+  CreatePrimaryUserCR:
+    Type: Custom::CreatePrimaryUser
+    Properties:
+      ServiceToken: !GetAtt CreatePrimaryUserLambda.Arn
+      DBHost: !GetAtt MyRDSInstance.Endpoint.Address
+      DBName: !Ref DBName
+      DBPort: 5432
+      MasterSecretArn: !Ref MasterSecretArn
+      PrimaryUserSecretArn: !Ref PrimaryUserSecret
+      PrimaryUsername: !Ref PrimaryUsername
+
+  #######################################
+  # Attach secret to RDS and enable rotation
+  #######################################
+  PrimaryUserSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref PrimaryUserSecret
+      TargetId: !Ref DBInstanceIdentifier
+      TargetType: AWS::RDS::DBInstance
+
+  PrimaryUserRotationSchedule:
+    Type: AWS::SecretsManager::RotationSchedule
+    DependsOn: PrimaryUserSecretAttachment
+    Properties:
+      SecretId: !Ref PrimaryUserSecret
+      HostedRotationLambda:
+        RotationType: PostgreSQLMultiUser
+        VPCConfig:
+          SubnetIds: !Ref VpcSubnets
+          SecurityGroupIds:
+            - !Ref LambdaSecurityGroup
+      RotationRules:
+        AutomaticallyAfterDays: 30
